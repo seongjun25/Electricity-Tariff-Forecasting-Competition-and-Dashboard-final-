@@ -1,11 +1,13 @@
 # dashboard/modules/tab3.py
 from pathlib import Path
-from io import StringIO
+from io import StringIO, BytesIO
 from datetime import time
 
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+from docxtpl import DocxTemplate, InlineImage
+from docx.shared import Mm
 
 MONTH_OPTIONS = [
     ("2024-01", "2024년 1월"),
@@ -32,6 +34,55 @@ WEEKDAY_LABELS = {
 }
 DATA_PATH = Path(__file__).resolve().parents[1] / "data" / "train.csv"
 CO2_PRICE_PATH = Path(__file__).resolve().parents[1] / "data" / "CO2.csv"
+REPORT_TEMPLATE_PATH = Path(__file__).resolve().parents[1] / "data" / "report_template.docx"
+REPORT_STATE_KEY = "tab3_report_state"
+
+REPORT_VALUE_KEYS = [
+    "period",
+    "total_usage",
+    "total_cost",
+    "total_emission",
+    "average_unit_cost",
+    "peak_usage",
+    "compare_average",
+    "pricing_plan",
+    "voltage_level",
+    "option",
+    "basic_unit_price",
+    "average_usage",
+    "demand_usage",
+    "basic_price",
+    "basic_price_average",
+    "cost_diff",
+    "leading_pf_average",
+    "lagging_pf_average",
+    "leading_violation",
+    "lagging_violation",
+    "additional_cost",
+    "discount_cost",
+    "net_cost",
+    "saving",
+    "allowance_criteria",
+    "emission_diff",
+    "credits_unit_cost",
+    "excess_emission",
+    "remaining_emission",
+    "purchase_cost",
+    "sales_revenue",
+]
+
+REPORT_FIGURE_KEYS = [
+    "trend_graph",
+    "peak_graph",
+    "trend_graph2",
+    "leading_pf_graph",
+    "lagging_pf_graph",
+    "heatmap",
+    "donut_chart",
+    "emission_graph",
+]
+
+REPORT_TABLE_KEYS = ["top_records"]
 CO2_PRICE_SCENARIOS = {
     "close": {"label": "종가", "column": "종가"},
     "open": {"label": "시가", "column": "시가"},
@@ -169,6 +220,62 @@ def determine_emission_granularity(range_df: pd.DataFrame, time_mode: str) -> st
 def build_week_range_label(start_ts: pd.Timestamp, end_ts: pd.Timestamp) -> str:
     """Format a week range label using mm-dd~mm-dd style."""
     return f"{start_ts.strftime('%m-%d')}~{end_ts.strftime('%m-%d')}"
+
+
+def _is_missing(value) -> bool:
+    try:
+        return pd.isna(value)
+    except Exception:
+        return value is None
+
+
+def set_report_value(payload: dict, key: str, value, *, decimals: int | None = None, suffix: str = "", formatter=None):
+    if key not in REPORT_VALUE_KEYS:
+        return
+    if formatter is not None:
+        payload["values"][key] = formatter(value)
+        return
+    if _is_missing(value):
+        payload["values"][key] = "-"
+        return
+    if decimals is None:
+        text = str(value)
+    else:
+        text = format_number(value, decimals=decimals)
+    if suffix:
+        text = f"{text}{suffix}"
+    payload["values"][key] = text
+
+
+def figure_to_inline_image(doc: DocxTemplate, fig: go.Figure | None, width_mm: float = 160) -> InlineImage | str:
+    if fig is None or not getattr(fig, "to_image", None) or not fig.data:
+        return ""
+    try:
+        image_bytes = fig.to_image(format="png", scale=2)
+    except Exception:
+        return ""
+    return InlineImage(doc, BytesIO(image_bytes), width=Mm(width_mm))
+
+
+def build_report_document(payload: dict) -> bytes | None:
+    if not REPORT_TEMPLATE_PATH.exists():
+        return None
+    doc = DocxTemplate(str(REPORT_TEMPLATE_PATH))
+
+    context: dict = {}
+    for key in REPORT_VALUE_KEYS:
+        context[key] = payload["values"].get(key, "-")
+    for key in REPORT_TABLE_KEYS:
+        context[key] = payload["tables"].get(key, [])
+    for key in REPORT_FIGURE_KEYS:
+        fig = payload["figures"].get(key)
+        context[key] = figure_to_inline_image(doc, fig)
+
+    doc.render(context)
+    buffer = BytesIO()
+    doc.save(buffer)
+    buffer.seek(0)
+    return buffer.getvalue()
 
 
 def build_emission_heatmap(
@@ -642,6 +749,8 @@ def render(title: str = "과거 데이터 분석"):
         unsafe_allow_html=True,
     )
 
+    report_payload = {"values": {}, "figures": {}, "tables": {}}
+
     raw_df, monthly_summary = load_data()
     monthly_summary = monthly_summary[monthly_summary["총전력사용량"] > 0].sort_index()
     raw_df = raw_df.sort_values("측정일시")
@@ -680,6 +789,7 @@ def render(title: str = "과거 데이터 분석"):
         selected_month_period = None
         trend_granularity = "monthly"
         custom_range = None
+        period_label = ""
         available_months = list(monthly_summary.index)
         if time_mode == "월별":
             if not available_months:
@@ -722,7 +832,7 @@ def render(title: str = "과거 데이터 분석"):
     summary_title = ""
     chart_config = {}
     report_df = None
-    download_name = "analysis.csv"
+    download_name = "analysis.docx"
     detail_source = raw_df
     top_records = pd.DataFrame()
     series_usage = pd.Series(dtype=float)
@@ -735,7 +845,8 @@ def render(title: str = "과거 데이터 분석"):
         summary_series = compute_overall_metrics(range_df)
         first_month = monthly_summary.index.min()
         last_month = monthly_summary.index.max()
-        summary_title = f"{format_month_label(first_month)} ~ {format_month_label(last_month)} 주요 지표"
+        period_label = f"{format_month_label(first_month)} ~ {format_month_label(last_month)}"
+        summary_title = f"{period_label} 주요 지표"
 
         chart_df = monthly_summary.reset_index().copy().fillna(0)
         monthly_avg = (
@@ -802,7 +913,6 @@ def render(title: str = "과거 데이터 분석"):
         }
         report_df = pd.concat([report_df, pd.DataFrame([totals_row])], ignore_index=True).fillna(0)
 
-        month_ticks = chart_df["월시작"].tolist()
         chart_config = {
             "x": chart_df["월시작"],
             "xaxis_title": "월",
@@ -814,10 +924,11 @@ def render(title: str = "과거 데이터 분석"):
             "cost_ma": chart_df["평균전기요금_3개월평균"],
             "cost_label": "전기요금 (월평균)",
             "cost_ma_label": "전기요금 (3개월 이동평균)",
-            "tickvals": month_ticks,
-            "ticktext": chart_df["표시월"].tolist(),
+            "tickvals": chart_df["월시작"],
+            "ticktext": chart_df["표시월"],
+            "tickformat": "%Y-%m",
         }
-        download_name = f"analysis_{first_month}_{last_month}.csv"
+        download_name = f"analysis_{first_month}_{last_month}.docx"
         detail_source = range_df
         series_usage = range_df["전력사용량(kWh)"]
         top_records = range_df.nlargest(5, "전력사용량(kWh)").copy()
@@ -886,7 +997,8 @@ def render(title: str = "과거 데이터 분석"):
             return
 
         summary_series = monthly_summary.loc[selected_month]
-        summary_title = f"{format_month_label(selected_month)} 주요 지표"
+        period_label = format_month_label(selected_month)
+        summary_title = f"{period_label} 주요 지표"
         monthly_change_map = {}
         if selected_month in available_months:
             sel_index = available_months.index(selected_month)
@@ -956,6 +1068,7 @@ def render(title: str = "과거 데이터 분석"):
             "cost_ma": daily_stats["전기요금_평균_7일평균"],
             "cost_label": "전기요금 (일평균)",
             "cost_ma_label": "전기요금 (7일 이동평균)",
+            "tickformat": "%Y-%m-%d",
         }
 
         report_df = daily_stats[
@@ -991,7 +1104,7 @@ def render(title: str = "과거 데이터 분석"):
             "평균단가(원/kWh)": coalesce_number(summary_series.get("평균단가"), 0.0),
         }
         report_df = pd.concat([report_df, pd.DataFrame([totals_row])], ignore_index=True).fillna(0)
-        download_name = f"analysis_{selected_month}.csv"
+        download_name = f"analysis_{selected_month}.docx"
         time_delta_month = range_df["측정일시"].max() - range_df["측정일시"].min()
         span_hours_month = time_delta_month.total_seconds() / 3600 if pd.notna(time_delta_month) else 0
         unique_points_month = range_df["측정일시"].nunique()
@@ -1049,7 +1162,8 @@ def render(title: str = "과거 데이터 분석"):
         range_df = range_df.sort_values("측정일시")
         detail_source = range_df
         summary_series = compute_overall_metrics(range_df)
-        summary_title = f"{custom_start.strftime('%Y-%m-%d')} ~ {custom_end.strftime('%Y-%m-%d')} 주요 지표"
+        period_label = f"{custom_start.strftime('%Y-%m-%d')} ~ {custom_end.strftime('%Y-%m-%d')}"
+        summary_title = f"{period_label} 주요 지표"
         series_usage = range_df["전력사용량(kWh)"]
         top_records = range_df.nlargest(5, "전력사용량(kWh)").copy()
 
@@ -1082,6 +1196,7 @@ def render(title: str = "과거 데이터 분석"):
                 "cost_ma": fifteen_avg["전기요금_평균_이동"],
                 "cost_label": "전기요금 (15분 평균)",
                 "cost_ma_label": "전기요금 (이동평균)",
+                "tickformat": "%m-%d %H:%M",
             }
             report_df = fifteen_avg[
                 ["측정일시", "전력사용량_평균", "전력사용량_평균_이동", "전기요금_평균", "전기요금_평균_이동", "탄소배출량"]
@@ -1104,7 +1219,7 @@ def render(title: str = "과거 데이터 분석"):
                 "탄소배출량(15분 평균,tCO2)": coalesce_number(range_df["탄소배출량(tCO2)"].mean(), 0.0),
             }
             report_df = pd.concat([report_df, pd.DataFrame([totals_row])], ignore_index=True).fillna(0)
-            download_name = f"analysis_custom_{custom_start.strftime('%Y%m%d')}_{custom_end.strftime('%Y%m%d')}.csv"
+            download_name = f"analysis_custom_{custom_start.strftime('%Y%m%d')}_{custom_end.strftime('%Y%m%d')}.docx"
             peak_mode = "15min"
             fifteen_peak = (
                 range_df.groupby("측정일시")["전력사용량(kWh)"]
@@ -1157,6 +1272,7 @@ def render(title: str = "과거 데이터 분석"):
                 "cost_ma": daily_stats["전기요금_평균_7일평균"],
                 "cost_label": "전기요금 (일평균)",
                 "cost_ma_label": "전기요금 (7일 이동평균)",
+                "tickformat": "%Y-%m-%d",
             }
             report_df = daily_stats[
                 [
@@ -1191,7 +1307,7 @@ def render(title: str = "과거 데이터 분석"):
                 "평균단가(원/kWh)": coalesce_number(summary_series.get("평균단가"), 0.0),
             }
             report_df = pd.concat([report_df, pd.DataFrame([totals_row])], ignore_index=True).fillna(0)
-            download_name = f"analysis_custom_{custom_start.strftime('%Y%m%d')}_{custom_end.strftime('%Y%m%d')}.csv"
+            download_name = f"analysis_custom_{custom_start.strftime('%Y%m%d')}_{custom_end.strftime('%Y%m%d')}.docx"
             peak_mode = "daily"
             peak_source = (
                 range_df.assign(날짜=range_df["측정일시"].dt.date)
@@ -1236,8 +1352,9 @@ def render(title: str = "과거 데이터 분석"):
                 "cost_ma": chart_df["평균전기요금_3개월평균"],
                 "cost_label": "전기요금 (월평균)",
                 "cost_ma_label": "전기요금 (3개월 이동평균)",
-                "tickvals": chart_df["월시작"].tolist(),
-                "ticktext": chart_df["표시월"].tolist(),
+                "tickvals": chart_df["월시작"],
+                "ticktext": chart_df["표시월"],
+                "tickformat": "%Y-%m",
             }
             report_df = chart_df[
                 [
@@ -1279,7 +1396,7 @@ def render(title: str = "과거 데이터 분석"):
                 "평균단가(원/kWh)": coalesce_number(summary_series.get("평균단가"), 0.0),
             }
         report_df = pd.concat([report_df, pd.DataFrame([totals_row])], ignore_index=True).fillna(0)
-        download_name = f"analysis_custom_{custom_start.strftime('%Y%m%d')}_{custom_end.strftime('%Y%m%d')}.csv"
+        download_name = f"analysis_custom_{custom_start.strftime('%Y%m%d')}_{custom_end.strftime('%Y%m%d')}.docx"
         if peak_mode is None or peak_source is None:
             peak_mode = "monthly"
             peak_source = (
@@ -1318,25 +1435,15 @@ def render(title: str = "과거 데이터 분석"):
             }
         )
 
-    if report_df is not None:
-        if "월" in report_df.columns:
-            report_df["월"] = report_df["월"].astype(str)
-        if "월(표시)" in report_df.columns:
-            report_df["월(표시)"] = report_df["월(표시)"].astype(str)
-        report_csv = dataframe_to_csv(report_df)
-    else:
-        report_csv = ""
+    set_report_value(report_payload, "period", period_label or "-", decimals=None)
+    set_report_value(report_payload, "total_usage", summary_series.get("총전력사용량"), decimals=0)
+    set_report_value(report_payload, "total_cost", summary_series.get("총전기요금"), decimals=0)
+    set_report_value(report_payload, "total_emission", summary_series.get("총탄소배출량"), decimals=2)
+    set_report_value(report_payload, "average_unit_cost", summary_series.get("평균단가"), decimals=2)
 
-    with button_container:
-        st.markdown('<div class="download-btn-container tab3-download">', unsafe_allow_html=True)
-        st.download_button(
-            label="분석 보고서 다운로드",
-            data=report_csv,
-            file_name=download_name,
-            mime="text/csv",
-            key="tab3_report_download",
-        )
-        st.markdown('</div>', unsafe_allow_html=True)
+    report_payload["tables"].setdefault("top_records", [])
+    report_bytes: bytes | None = None
+    report_error: str | None = None
 
     inner_tab_labels = [
         "주요 지표",
@@ -1465,9 +1572,17 @@ def render(title: str = "과거 데이터 분석"):
             tickfont=dict(color="#1A202C"),
         )
         if "tickvals" in chart_config:
-            xaxis_settings["tickvals"] = chart_config["tickvals"]
+            tickvals = chart_config["tickvals"]
+            if isinstance(tickvals, (pd.Series, pd.Index)):
+                tickvals = tickvals.tolist()
+            xaxis_settings["tickvals"] = tickvals
         if "ticktext" in chart_config:
-            xaxis_settings["ticktext"] = chart_config["ticktext"]
+            ticktext = chart_config["ticktext"]
+            if isinstance(ticktext, (pd.Series, pd.Index)):
+                ticktext = ticktext.tolist()
+            xaxis_settings["ticktext"] = ticktext
+        if "tickformat" in chart_config:
+            xaxis_settings["tickformat"] = chart_config["tickformat"]
 
         daily_fig.update_layout(
             template="plotly_dark",
@@ -1498,6 +1613,7 @@ def render(title: str = "과거 데이터 분석"):
             paper_bgcolor="#F7FAFC",
             plot_bgcolor="#F7FAFC",
         )
+        report_payload["figures"]["trend_graph"] = daily_fig
         st.plotly_chart(daily_fig, config={"displayModeBar": True})
 
         if detail_source.empty:
@@ -1651,6 +1767,7 @@ def render(title: str = "과거 데이터 분석"):
         else:
             peak_fig = go.Figure()
             seasonal_line_colors = {key: SEASON_STYLE.get(key, {}) for key in SEASON_GROUPS}
+            peak_axis_format = None
 
             def add_seasonal_reference_lines(x_values):
                 x_list = list(x_values)
@@ -1726,6 +1843,7 @@ def render(title: str = "과거 데이터 분석"):
             if peak_mode == "monthly":
                 peak_x = peak_source["월시작"]
                 peak_y = peak_source["피크전력사용량(kWh)"]
+                peak_axis_format = "%Y-%m"
                 peak_fig.add_trace(
                     go.Scatter(
                         x=peak_x,
@@ -1786,8 +1904,9 @@ def render(title: str = "과거 데이터 분석"):
                     plot_bgcolor="#F7FAFC",
                 )
             elif peak_mode == "daily":
-                peak_x = peak_source["날짜"]
+                peak_x = pd.to_datetime(peak_source["날짜"])
                 peak_y = peak_source["피크전력사용량(kWh)"]
+                peak_axis_format = "%Y-%m-%d"
                 peak_fig.add_trace(
                     go.Scatter(
                         x=peak_x,
@@ -1808,7 +1927,7 @@ def render(title: str = "과거 데이터 분석"):
                             name=label_config["avg"],
                             line=dict(color="#6366F1", width=2, dash="dot"),
                         )
-                )
+                    )
                 add_seasonal_reference_lines(peak_x)
                 add_peak_reference_line(peak_x, peak_y)
                 y_lower_bound_daily = 120.0
@@ -1840,9 +1959,10 @@ def render(title: str = "과거 데이터 분석"):
                     paper_bgcolor="#F7FAFC",
                     plot_bgcolor="#F7FAFC",
                 )
-            else:  # 15분 단위
+            elif peak_mode == "15min":
                 peak_x = peak_source["측정일시"]
                 peak_y = peak_source["피크전력사용량(kWh)"]
+                peak_axis_format = "%Y-%m-%d %H:%M"
                 peak_fig.add_trace(
                     go.Scatter(
                         x=peak_x,
@@ -1896,8 +2016,27 @@ def render(title: str = "과거 데이터 분석"):
                     paper_bgcolor="#F7FAFC",
                     plot_bgcolor="#F7FAFC",
                 )
-            with peak_col_left:
-                st.plotly_chart(peak_fig, config={"displayModeBar": True})
+            else:
+                peak_fig.update_layout(
+                    template="plotly_dark",
+                    margin=dict(l=10, r=10, t=60, b=40),
+                    font=dict(color="#1A202C"),
+                    xaxis=dict(
+                        title=label_config["x_title"],
+                        tickfont=dict(color="#1A202C"),
+                    ),
+                    yaxis=dict(
+                        title="전력사용량 (kWh, 15분)",
+                        tickfont=dict(color="#1A202C"),
+                    ),
+                    paper_bgcolor="#F7FAFC",
+                    plot_bgcolor="#F7FAFC",
+                )
+            if peak_axis_format:
+                peak_fig.update_xaxes(tickformat=peak_axis_format)
+        with peak_col_left:
+            report_payload["figures"]["peak_graph"] = peak_fig
+            st.plotly_chart(peak_fig, config={"displayModeBar": True})
 
         if top_records.empty:
             with peak_col_right:
@@ -1933,6 +2072,29 @@ def render(title: str = "과거 데이터 분석"):
                     "전력사용량(kWh)": "전력사용량(kWh)",
                 }
             )
+            records_for_report = []
+            for _, row in styled_df.iterrows():
+                row_id = row.get("id", row.get("ID", "-"))
+                timestamp_str = row.get("측정일시", "-")
+                weekday_str = row.get("요일", "-")
+                usage_str = row.get("전력사용량(kWh)", "-")
+                if _is_missing(row_id):
+                    row_id = "-"
+                if _is_missing(timestamp_str):
+                    timestamp_str = "-"
+                if _is_missing(weekday_str):
+                    weekday_str = "-"
+                if _is_missing(usage_str):
+                    usage_str = "-"
+                records_for_report.append(
+                    {
+                        "id": str(row_id),
+                        "timestamp": str(timestamp_str),
+                        "weekday": str(weekday_str),
+                        "usage": str(usage_str),
+                    }
+                )
+            report_payload["tables"]["top_records"] = records_for_report
             table_css = """
                 <style>
                 .peak-table-wrap {
@@ -2020,6 +2182,11 @@ def render(title: str = "과거 데이터 분석"):
                     st.markdown("옵션")
                     st.markdown("<div style='font-size:14px;color:#4A5568;'>기본</div>", unsafe_allow_html=True)
 
+            option_display = selected_option if selected_option else option_placeholder
+            set_report_value(report_payload, "pricing_plan", selected_tariff, decimals=None)
+            set_report_value(report_payload, "voltage_level", selected_voltage, decimals=None)
+            set_report_value(report_payload, "option", option_display or "-", decimals=None)
+
             base_rate = get_basic_rate(selected_tariff, selected_voltage, selected_option if option_keys else "")
             with config_cols[3]:
                 if base_rate is not None:
@@ -2027,6 +2194,7 @@ def render(title: str = "과거 데이터 분석"):
                 else:
                     st.metric("기본요금 단가", "-")
 
+            set_report_value(report_payload, "basic_unit_price", base_rate, decimals=0)
             if base_rate is None:
                 st.warning("선택한 조건에 해당하는 기본요금 단가를 확인할 수 없습니다.")
                 return
@@ -2040,6 +2208,11 @@ def render(title: str = "과거 데이터 분석"):
                     period_peak_kwh = float(peak_val)
                 if pd.notna(mean_val):
                     period_avg_kwh = float(mean_val)
+
+            peak_kw_value = period_peak_kwh * 4 if pd.notna(period_peak_kwh) else pd.NA
+            avg_kw_value = period_avg_kwh * 4 if pd.notna(period_avg_kwh) else pd.NA
+            set_report_value(report_payload, "peak_usage", peak_kw_value, decimals=1)
+            set_report_value(report_payload, "average_usage", avg_kw_value, decimals=1)
 
             billing_peak_kwh = pd.NA
             billing_peak_label = "누적 최대"
@@ -2088,6 +2261,11 @@ def render(title: str = "과거 데이터 분석"):
         if pd.notna(peak_charge) and pd.notna(avg_charge):
             charge_gap = peak_charge - avg_charge
 
+        set_report_value(report_payload, "demand_usage", chargeable_kw, decimals=1)
+        set_report_value(report_payload, "basic_price", peak_charge, decimals=0)
+        set_report_value(report_payload, "basic_price_average", avg_charge, decimals=0)
+        set_report_value(report_payload, "cost_diff", charge_gap, decimals=0)
+
         ratio_against_avg = None
         if pd.notna(avg_kw_current) and avg_kw_current != 0 and pd.notna(chargeable_kw):
             ratio_against_avg = (chargeable_kw / avg_kw_current - 1) * 100
@@ -2120,12 +2298,22 @@ def render(title: str = "과거 데이터 분석"):
             decimals=1,
         )
 
+        diff_pct_value = None
         if pd.notna(period_peak_kwh) and pd.notna(period_avg_kwh) and period_peak_kwh != 0:
             diff_pct = (period_avg_kwh / period_peak_kwh - 1) * 100
             delta_class = "positive" if diff_pct > 0 else "negative" if diff_pct < 0 else "neutral"
             avg_delta_html = f'<div class="metric-delta {delta_class}">기간 최대 대비 <strong>{diff_pct:+.1f}%</strong></div>'
+            diff_pct_value = diff_pct
         else:
             avg_delta_html = ""
+
+        set_report_value(
+            report_payload,
+            "compare_average",
+            diff_pct_value,
+            decimals=None,
+            formatter=lambda v: f"{v:+.1f}%" if not _is_missing(v) else "-",
+        )
 
         render_metric_card(
             card_row_one[1],
@@ -2354,6 +2542,35 @@ def render(title: str = "과거 데이터 분석"):
                 day_violation_ratio = float((day_pf < PF_DAY_THRESHOLD).mean() * 100) if not day_pf.empty else pd.NA
                 night_violation_ratio = float((night_pf < PF_NIGHT_THRESHOLD).mean() * 100) if not night_pf.empty else pd.NA
 
+                set_report_value(
+                    report_payload,
+                    "leading_pf_average",
+                    day_avg_actual,
+                    decimals=None,
+                    formatter=lambda v: "-" if _is_missing(v) else f"{format_number(v, 1)}%",
+                )
+                set_report_value(
+                    report_payload,
+                    "lagging_pf_average",
+                    night_avg_actual,
+                    decimals=None,
+                    formatter=lambda v: "-" if _is_missing(v) else f"{format_number(v, 1)}%",
+                )
+                set_report_value(
+                    report_payload,
+                    "leading_violation",
+                    day_violation_ratio,
+                    decimals=None,
+                    formatter=lambda v: "-" if _is_missing(v) else f"{format_number(v, 1)}%",
+                )
+                set_report_value(
+                    report_payload,
+                    "lagging_violation",
+                    night_violation_ratio,
+                    decimals=None,
+                    formatter=lambda v: "-" if _is_missing(v) else f"{format_number(v, 1)}%",
+                )
+
                 day_df = pf_df.loc[day_mask].copy()
                 night_df = pf_df.loc[night_mask].copy()
                 if not day_df.empty:
@@ -2375,6 +2592,7 @@ def render(title: str = "과거 데이터 분석"):
 
                 if (not day_df.empty) or (not night_df.empty):
                     monthly_fig = go.Figure()
+                    pf_axis_format = None
                     if pf_plot_mode == "monthly":
                         x_ticks = None
                         if not day_df.empty:
@@ -2451,6 +2669,7 @@ def render(title: str = "과거 데이터 분석"):
                             paper_bgcolor="#F7FAFC",
                             plot_bgcolor="#F7FAFC",
                         )
+                        pf_axis_format = "%Y-%m"
                     elif pf_plot_mode == "daily":
                         if not day_df.empty:
                             daily_day = (
@@ -2515,6 +2734,7 @@ def render(title: str = "과거 데이터 분석"):
                             paper_bgcolor="#F7FAFC",
                             plot_bgcolor="#F7FAFC",
                         )
+                        pf_axis_format = "%Y-%m-%d"
                     else:  # 15분 단위
                         if not day_df.empty:
                             day_line_df = day_df[["측정일시", "지상역률(%)"]].dropna()
@@ -2573,8 +2793,11 @@ def render(title: str = "과거 데이터 분석"):
                             paper_bgcolor="#F7FAFC",
                             plot_bgcolor="#F7FAFC",
                         )
+                        pf_axis_format = "%Y-%m-%d %H:%M"
                     if not monthly_fig.data:
                         monthly_fig = None
+                    elif monthly_fig and monthly_fig.data and pf_axis_format:
+                        monthly_fig.update_xaxes(tickformat=pf_axis_format)
 
                 day_hour_series = (
                     pf_df.groupby("hour")["지상역률(%)"].mean().reindex(range(24)) if not pf_df.empty else pd.Series(dtype=float)
@@ -2587,6 +2810,8 @@ def render(title: str = "과거 데이터 분석"):
                 pf_tabs = st.tabs([trend_tab_title, "시간대 분석"])
                 with pf_tabs[0]:
                     if monthly_fig and monthly_fig.data:
+                        if "trend_graph2" not in report_payload["figures"]:
+                            report_payload["figures"]["trend_graph2"] = monthly_fig
                         st.plotly_chart(monthly_fig, config={"displayModeBar": True}, use_container_width=True)
                     else:
                         if pf_plot_mode == "daily":
@@ -2673,6 +2898,7 @@ def render(title: str = "과거 데이터 분석"):
                             )
                             with hour_cols[0]:
                                 st.markdown("###### 지상 역률")
+                                report_payload["figures"]["leading_pf_graph"] = day_fig
                                 st.plotly_chart(day_fig, config={"displayModeBar": True}, use_container_width=True)
                         else:
                             with hour_cols[0]:
@@ -2740,6 +2966,7 @@ def render(title: str = "과거 데이터 분석"):
                             )
                             with hour_cols[1]:
                                 st.markdown("###### 진상 역률")
+                                report_payload["figures"]["lagging_pf_graph"] = night_fig
                                 st.plotly_chart(night_fig, config={"displayModeBar": True}, use_container_width=True)
                         else:
                             with hour_cols[1]:
@@ -2763,6 +2990,11 @@ def render(title: str = "과거 데이터 분석"):
                 total_discount_amount = day_discount_amount
                 net_effect_amount = total_penalty_amount - total_discount_amount
                 savings_if_compliant = total_penalty_amount
+
+                set_report_value(report_payload, "additional_cost", total_penalty_amount, decimals=0)
+                set_report_value(report_payload, "discount_cost", total_discount_amount, decimals=0)
+                set_report_value(report_payload, "net_cost", net_effect_amount, decimals=0)
+                set_report_value(report_payload, "saving", savings_if_compliant, decimals=0)
 
                 pf_card_row_one = st.columns(4, gap="large")
 
@@ -2923,6 +3155,9 @@ def render(title: str = "과거 데이터 분석"):
         allowance_total_value = float(allowance_total) if pd.notna(allowance_total) else 0.0
         emission_total = coalesce_number(range_df["탄소배출량(tCO2)"].sum(), 0.0) if not range_df.empty else 0.0
         allowance_delta = emission_total - allowance_total if pd.notna(allowance_total) else pd.NA
+        set_report_value(report_payload, "total_emission", emission_total, decimals=2)
+        set_report_value(report_payload, "allowance_criteria", allowance_total, decimals=1)
+        set_report_value(report_payload, "emission_diff", allowance_delta, decimals=1)
         emission_granularity = determine_emission_granularity(range_df, time_mode)
         with allowance_controls[1]:
             if pd.notna(allowance_total) and months_equiv > 0:
@@ -2984,7 +3219,8 @@ def render(title: str = "과거 데이터 분석"):
                 )
                 pivot.columns = [f"{int(m)}월" for m in month_numbers]
                 heatmap_fig = build_emission_heatmap(pivot, wrap_columns=7)
-                if heatmap_fig:
+                if heatmap_fig and heatmap_fig.data:
+                    report_payload["figures"].setdefault("heatmap", heatmap_fig)
                     st.plotly_chart(heatmap_fig, config={"displayModeBar": True}, use_container_width=True)
                 else:
                     st.info("월별 탄소 배출량 데이터를 표시할 수 없습니다.")
@@ -3057,10 +3293,13 @@ def render(title: str = "과거 데이터 분석"):
                         .reindex(columns=sorted(day_numbers.unique()))
                     )
                     pivot.columns = [f"{int(day)}일" for day in pivot.columns]
-                heatmap_fig = build_emission_heatmap(pivot, wrap_columns=7)
-                if heatmap_fig:
-                    st.markdown("#### 일별 탄소 배출량 히트맵")
-                    st.plotly_chart(heatmap_fig, config={"displayModeBar": True}, use_container_width=True)
+                    heatmap_fig = build_emission_heatmap(pivot, wrap_columns=7)
+                    if heatmap_fig and heatmap_fig.data:
+                        report_payload["figures"].setdefault("heatmap", heatmap_fig)
+                        st.markdown("#### 일별 탄소 배출량 히트맵")
+                        st.plotly_chart(heatmap_fig, config={"displayModeBar": True}, use_container_width=True)
+                    else:
+                        st.info("일별 배출량 데이터를 표시할 수 없습니다.")
         elif time_mode == "사용자 정의":
             st.markdown("#### 사용자 정의 기간 요약")
             unique_days = range_df["측정일시"].dt.normalize().nunique()
@@ -3183,7 +3422,8 @@ def render(title: str = "과거 데이터 분석"):
                         )
                         heatmap_fig = build_emission_heatmap(pivot, wrap_columns=7)
                         heatmap_title = "#### 월별 탄소 배출량 히트맵"
-                if heatmap_fig:
+                if heatmap_fig and heatmap_fig.data:
+                    report_payload["figures"].setdefault("heatmap", heatmap_fig)
                     st.markdown(heatmap_title)
                     st.plotly_chart(heatmap_fig, config={"displayModeBar": True}, use_container_width=True)
                 else:
@@ -3212,6 +3452,7 @@ def render(title: str = "과거 데이터 분석"):
         price_date, price_value = pick_co2_price(co2_price_df, scenario_key, price_reference_date)
         scenario_label = CO2_PRICE_SCENARIOS[scenario_key]["label"]
         price_display = format_number(price_value, 0) if price_value is not None else "-"
+        set_report_value(report_payload, "credits_unit_cost", price_value, decimals=0)
         with sim_controls[1]:
             if price_value is None:
                 st.caption("ℹ️ 탄소배출권 가격 데이터를 찾을 수 없습니다.")
@@ -3229,6 +3470,10 @@ def render(title: str = "과거 데이터 분석"):
         sale_revenue = (
             surplus_amount * price_value if price_value is not None and pd.notna(surplus_amount) else pd.NA
         )
+        set_report_value(report_payload, "excess_emission", excess_amount, decimals=1)
+        set_report_value(report_payload, "remaining_emission", surplus_amount, decimals=1)
+        set_report_value(report_payload, "purchase_cost", purchase_cost, decimals=0)
+        set_report_value(report_payload, "sales_revenue", sale_revenue, decimals=0)
 
         sim_cards = st.columns(4, gap="large")
         render_metric_card(
@@ -3302,6 +3547,7 @@ def render(title: str = "과거 데이터 분석"):
                     plot_bgcolor="#F7FAFC",
                     showlegend=False,
                 )
+                report_payload["figures"]["donut_chart"] = donut_fig
                 st.plotly_chart(donut_fig, config={"displayModeBar": False}, use_container_width=True)
             else:
                 st.info("허용량이 설정되지 않아 게이지를 표시할 수 없습니다.")
@@ -3318,6 +3564,7 @@ def render(title: str = "과거 데이터 분석"):
                 allowance_line_value = 0.0
                 x_axis_title = ""
                 xaxis_kwargs: dict = {}
+                emission_axis_format = None
 
                 if emission_granularity == "hourly":
                     hourly_agg = (
@@ -3332,6 +3579,7 @@ def render(title: str = "과거 데이터 분석"):
                     allowance_label = "시간 허용량"
                     x_axis_title = "시간"
                     xaxis_kwargs = dict(title=x_axis_title, tickformat="%m-%d\n%H:%M")
+                    emission_axis_format = "%Y-%m-%d %H:%M"
                 elif emission_granularity == "daily":
                     daily_agg = (
                         emission_series.resample("D").sum(min_count=1).reset_index().sort_values("측정일시")
@@ -3351,6 +3599,7 @@ def render(title: str = "과거 데이터 분석"):
                     allowance_label = "일 허용량"
                     x_axis_title = "일자"
                     xaxis_kwargs = dict(title=x_axis_title, tickformat="%m-%d")
+                    emission_axis_format = "%Y-%m-%d"
                 elif emission_granularity == "weekly":
                     weekly_agg = (
                         emission_series.resample("W-MON", label="left", closed="left")
@@ -3380,6 +3629,7 @@ def render(title: str = "과거 데이터 분석"):
                         tickvals=tick_vals,
                         ticktext=hover_labels,
                     )
+                    emission_axis_format = "%Y-%m-%d"
                 else:
                     monthly_agg = (
                         emission_series.resample("M").sum(min_count=1).reset_index().sort_values("측정일시")
@@ -3392,7 +3642,15 @@ def render(title: str = "과거 데이터 분석"):
                     )
                     allowance_label = "월 허용량"
                     x_axis_title = "월"
-                    xaxis_kwargs = dict(title=x_axis_title, tickformat="%Y-%m")
+                    tick_vals = x_data.tolist()
+                    xaxis_kwargs = dict(
+                        title=x_axis_title,
+                        tickmode="array",
+                        tickvals=tick_vals,
+                        ticktext=hover_labels,
+                        tickangle=-40,
+                    )
+                    emission_axis_format = "%Y-%m"
 
                 if trend_df.empty:
                     st.info("기간 내 탄소 배출량 추세 데이터를 표시할 수 없습니다.")
@@ -3430,4 +3688,82 @@ def render(title: str = "과거 데이터 분석"):
                         plot_bgcolor="#F7FAFC",
                         legend=dict(orientation="h", y=1.1, x=0.5, xanchor="center"),
                     )
+                    if emission_axis_format:
+                        trend_fig.update_xaxes(tickformat=emission_axis_format)
+                    report_payload["figures"]["emission_graph"] = trend_fig
                     st.plotly_chart(trend_fig, config={"displayModeBar": True}, use_container_width=True)
+
+    range_start = None
+    range_end = None
+    if "range_df" in locals() and range_df is not None and hasattr(range_df, "empty") and not range_df.empty:
+        if "측정일시" in range_df.columns:
+            range_start = range_df["측정일시"].min()
+            range_end = range_df["측정일시"].max()
+    elif detail_source is not None and hasattr(detail_source, "empty") and not detail_source.empty:
+        if "측정일시" in detail_source.columns:
+            range_start = detail_source["측정일시"].min()
+            range_end = detail_source["측정일시"].max()
+
+    def _ts_to_iso(value):
+        if isinstance(value, pd.Timestamp):
+            return value.isoformat()
+        return str(value) if value is not None else ""
+
+    report_signature = {
+        "time_mode": time_mode,
+        "period": period_label or "",
+        "start": _ts_to_iso(range_start),
+        "end": _ts_to_iso(range_end),
+        "download": download_name,
+    }
+
+    existing_state = st.session_state.get(REPORT_STATE_KEY)
+    if existing_state and existing_state.get("signature") != report_signature:
+        st.session_state.pop(REPORT_STATE_KEY, None)
+        existing_state = None
+
+    template_available = REPORT_TEMPLATE_PATH.exists()
+
+    with button_container:
+        st.markdown('<div class="download-btn-container tab3-download">', unsafe_allow_html=True)
+
+        if template_available:
+            generate_clicked = st.button("보고서 생성", key="tab3_report_generate")
+            if generate_clicked:
+                with st.spinner("보고서를 생성 중입니다..."):
+                    try:
+                        generated_bytes = build_report_document(report_payload)
+                    except Exception as exc:
+                        st.session_state[REPORT_STATE_KEY] = {
+                            "bytes": None,
+                            "error": str(exc),
+                            "signature": report_signature,
+                        }
+                    else:
+                        st.session_state[REPORT_STATE_KEY] = {
+                            "bytes": generated_bytes,
+                            "error": None,
+                            "signature": report_signature,
+                        }
+
+            state = st.session_state.get(REPORT_STATE_KEY)
+            if state and state.get("signature") == report_signature:
+                error_message = state.get("error")
+                report_bytes = state.get("bytes")
+                if report_bytes:
+                    st.success("보고서가 준비되었습니다. 다운로드 버튼을 눌러 저장하세요.")
+                    st.download_button(
+                        label="분석 보고서 다운로드",
+                        data=report_bytes,
+                        file_name=download_name,
+                        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                        key="tab3_report_download",
+                    )
+                elif error_message:
+                    st.error(f"보고서를 생성할 수 없습니다: {error_message}")
+            else:
+                st.caption("보고서를 다운로드하려면 '보고서 생성' 버튼을 눌러주세요.")
+        else:
+            st.info("보고서 템플릿을 찾을 수 없습니다.")
+
+        st.markdown("</div>", unsafe_allow_html=True)
