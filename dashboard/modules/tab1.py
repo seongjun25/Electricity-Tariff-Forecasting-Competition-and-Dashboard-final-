@@ -19,7 +19,7 @@ def load_data():
     # 파일이 없으면 빈 데이터프레임이나 샘플 데이터를 반환하도록 처리할 수 있습니다.
     try:
         # 1-11월 히스토리컬 데이터
-        train_df = pd.read_csv('data/train.csv')
+        train_df = pd.read_csv('../data/train.csv')
         train_df['측정일시'] = pd.to_datetime(train_df['측정일시'])
     except FileNotFoundError:
         st.warning("data/train.csv 파일을 찾을 수 없습니다. 임시 데이터를 사용합니다.")
@@ -31,7 +31,7 @@ def load_data():
 
     try:
         # 12월 테스트(스트리밍) 데이터
-        test_df = pd.read_csv('data/test_streamling.csv')
+        test_df = pd.read_csv('../data/test_streamling.csv')
         test_df['측정일시'] = pd.to_datetime(test_df['측정일시'])
     except FileNotFoundError:
         st.warning("data/test_streamling.csv 파일을 찾을 수 없습니다. 임시 데이터를 사용합니다.")
@@ -163,7 +163,7 @@ def render(tab_name):
 
     with header_col2:
         try:
-            st.image('ls_electric_logo.png', width=300)
+            st.image('../ls_electric_logo.png', width=300)
         except:
             st.warning("로고 이미지를 찾을 수 없습니다.")
     
