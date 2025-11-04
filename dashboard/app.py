@@ -3,7 +3,7 @@ import streamlit as st
 from modules import tab1, tab2, tab3
 from modules.common import inject_css   # ← modules 경로에서 import
 
-st.set_page_config(page_title="대시보드", page_icon="📊", layout="wide")
+st.set_page_config(page_title="전력 관리 대시보드", page_icon="📊", layout="wide")
 
 # 스타일 먼저 주입
 inject_css()
